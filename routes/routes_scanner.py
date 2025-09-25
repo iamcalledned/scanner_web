@@ -1,4 +1,4 @@
-from flask import Blueprint, render_template, send_from_directory, request, jsonify
+from flask import Blueprint, render_template, send_from_directory, request, jsonify, redirect
 from pathlib import Path
 import datetime
 import json
@@ -6,13 +6,22 @@ from collections import defaultdict
 from werkzeug.utils import secure_filename
 import shutil
 import os
+import time
+import threading
+import uuid
 
 scanner_bp = Blueprint("scanner", __name__)
+LOGIN_PROCESS_URL = os.environ.get('LOGIN_PROCESS_URL', 'http://127.0.0.1:8010/api/login')
 ARCHIVE_DIR = "/home/ned/scanner_archive/clean"
 PD_DIR = Path("/home/ned/scanner_archive/clean/pd")
 REVIEW_DIR = Path("/home/ned/scanner_archive/review")
 SEGMENT_DIR = Path("/home/ned/scanner_archive/segmentation/processed")
 CALLS_PER_PAGE = 10
+
+# Simple in-memory active user registry. Key: client_id -> {last_seen, ip, ua, page}
+ACTIVE_USERS = {}
+ACTIVE_LOCK = threading.Lock()
+ACTIVE_TIMEOUT = 120  # seconds considered "active"
 
 
 
@@ -159,6 +168,13 @@ def scanner_fire():
     return render_template("scanner_fire.html", calls=calls[:CALLS_PER_PAGE])
 
 
+# Backwards-compatible aliases: some links use /scanner_fd — keep working
+@scanner_bp.route("/scanner_fd")
+def scanner_fd():
+    # Delegate to the existing scanner_fire handler
+    return scanner_fire()
+
+
 @scanner_bp.route("/scanner")
 def scanner_list():
     calls = load_calls(f"{ARCHIVE_DIR}/pd", filter_today=True)
@@ -168,6 +184,12 @@ def scanner_list():
     if request.headers.get("Accept") == "application/json" or request.args.get("json") == "1":
         return jsonify({"calls": calls[start:end]})
     return render_template("scanner.html", calls=calls[:CALLS_PER_PAGE])
+
+
+# Accept trailing slash as well so `/scanner/` doesn't 404.
+@scanner_bp.route("/scanner/")
+def scanner_list_slash():
+    return scanner_list()
 
 
 @scanner_bp.route("/scanner/archive")
@@ -277,6 +299,59 @@ def submit_edit():
         return jsonify({"success": True})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+@scanner_bp.route('/scanner/_heartbeat', methods=['POST'])
+def scanner_heartbeat():
+    """Receive periodic heartbeats from clients to mark them active."""
+    data = request.get_json(silent=True) or {}
+    client_id = data.get('client_id') or str(uuid.uuid4())
+    page = data.get('page', '')
+    ua = request.headers.get('User-Agent', '')
+    now = time.time()
+    with ACTIVE_LOCK:
+        ACTIVE_USERS[client_id] = {
+            'last_seen': now,
+            'ip': request.remote_addr,
+            'ua': ua,
+            'page': page,
+        }
+    return jsonify({'success': True, 'client_id': client_id})
+
+
+
+@scanner_bp.route('/scanner/login')
+def scanner_login():
+    """Redirect to the external login process (FastAPI Cognito flow).
+
+    The external login process should handle the auth code flow and redirect
+    back to your app's redirect URI. The default `LOGIN_PROCESS_URL` points to
+    the FastAPI login endpoint in your other project. Configure via
+    environment variable `LOGIN_PROCESS_URL`.
+    """
+    return redirect(LOGIN_PROCESS_URL)
+
+
+@scanner_bp.route('/scanner/admin/active')
+def scanner_active():
+    """Return currently active clients seen within ACTIVE_TIMEOUT seconds."""
+    cutoff = time.time() - ACTIVE_TIMEOUT
+    with ACTIVE_LOCK:
+        # remove stale entries to keep memory small
+        stale = [k for k, v in ACTIVE_USERS.items() if v['last_seen'] < cutoff]
+        for k in stale:
+            del ACTIVE_USERS[k]
+        active = [
+            {
+                'client_id': k,
+                'ip': v['ip'],
+                'ua': v['ua'],
+                'page': v.get('page', ''),
+                'last_seen': v['last_seen']
+            }
+            for k, v in ACTIVE_USERS.items()
+        ]
+    return jsonify({'active_count': len(active), 'active': active})
 
 
 @scanner_bp.route("/api/pd_heatmap")
